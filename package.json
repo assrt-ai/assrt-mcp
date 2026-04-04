@@ -1,0 +1,21 @@
+{
+  "name": "@assrt/sdk",
+  "version": "0.1.0",
+  "description": "AI-powered testing framework built on Playwright. Write tests in plain English.",
+  "author": "Assrt <i@m13v.com>",
+  "license": "MIT",
+  "homepage": "https://assrt.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/assrt-ai/assrt-sdk"
+  },
+  "keywords": [
+    "testing",
+    "playwright",
+    "ai",
+    "e2e",
+    "automation",
+    "self-healing"
+  ],
+  "main": "index.js"
+}
