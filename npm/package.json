@@ -7,7 +7,7 @@
   "author": "Assrt <matt@assrt.ai>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/assrt-ai/assrt-sdk.git"
+    "url": "git+https://github.com/assrt-ai/assrt-mcp.git"
   },
   "homepage": "https://assrt.ai",
   "bin": {
