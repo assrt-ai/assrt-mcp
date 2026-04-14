@@ -9,7 +9,7 @@
  *   npx assrt run --url http://localhost:3000 --plan "..." --json > results.json
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { getCredential } from "./core/keychain";
@@ -27,6 +27,7 @@ function printUsage(): void {
     "  --plan        Test scenarios as inline text\n" +
     "  --plan-file   Path to a file containing test scenarios\n" +
     "  --model       LLM model to use (default: claude-haiku-4-5-20251001)\n" +
+    "  --headed      Launch a visible browser window (default: headless)\n" +
     "  --json        Output raw JSON report to stdout\n" +
     "  --help        Show this help message\n\n" +
     "Auth: Uses ANTHROPIC_API_KEY env var, or reads Claude Code credentials from macOS Keychain."
@@ -40,6 +41,7 @@ function parseArgs(argv: string[]): {
   planFile?: string;
   model?: string;
   json: boolean;
+  headed: boolean;
 } {
   const args: Record<string, string | boolean> = {};
   const command = argv[0] || "";
@@ -54,6 +56,10 @@ function parseArgs(argv: string[]): {
       args.json = true;
       continue;
     }
+    if (arg === "--headed") {
+      args.headed = true;
+      continue;
+    }
     if (arg.startsWith("--") && i + 1 < argv.length) {
       args[arg.slice(2)] = argv[++i];
     }
@@ -66,6 +72,7 @@ function parseArgs(argv: string[]): {
     planFile: args["plan-file"] as string | undefined,
     model: args.model as string | undefined,
     json: !!args.json,
+    headed: !!args.headed || process.env.ASSRT_HEADED === "1" || process.env.ASSRT_HEADED === "true",
   };
 }
 
@@ -149,8 +156,10 @@ function printReport(report: TestReport): void {
 
 // ── Setup command ──
 
-const POST_COMMIT_HOOK = `#!/bin/bash
-# Assrt: suggest QA testing after git commit/push
+const QA_REMINDER_HOOK = `#!/bin/bash
+# Assrt: Claude Code PostToolUse reminder — fires after any Bash tool use,
+# injects a QA-testing reminder when the command was a git commit/push.
+# NOT a git post-commit hook.
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 if echo "$COMMAND" | grep -qE 'git (commit|push)'; then
@@ -159,26 +168,24 @@ fi
 `;
 
 function setupAssrt(): void {
-  const cwd = process.env.INIT_CWD || process.cwd();
-  console.error("[assrt] Setting up Assrt in this project...\n");
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  console.error("[assrt] Setting up Assrt globally...\n");
 
-  // 1. Register MCP server
-  console.error("[1/3] Registering MCP server...");
+  // 1. Register MCP server globally (--scope user)
+  console.error("[1/3] Registering MCP server (global)...");
   try {
-    // Check if claude CLI exists first
     execSync("which claude", { stdio: ["pipe", "pipe", "pipe"], timeout: 5000 });
     try {
-      // Use add-json instead of `add ... --` which hangs during health check
       const mcpConfig = JSON.stringify({
         type: "stdio",
         command: "npx",
         args: ["-y", "-p", "@assrt-ai/assrt", "assrt-mcp"],
       });
-      execSync(`claude mcp add-json assrt '${mcpConfig}'`, {
+      execSync(`claude mcp add-json assrt '${mcpConfig}' --scope user`, {
         stdio: ["pipe", "pipe", "pipe"],
         timeout: 15000,
       });
-      console.error("      Done: MCP server registered\n");
+      console.error("      Done: MCP server registered globally\n");
     } catch {
       console.error("      Skipped: MCP server already registered\n");
     }
@@ -186,44 +193,58 @@ function setupAssrt(): void {
     console.error("      Skipped: 'claude' CLI not found in PATH\n");
   }
 
-  // 2. Install PostToolUse hook
-  console.error("[2/3] Installing post-commit hook...");
-  const hookDir = join(cwd, ".claude", "hooks");
-  const hookPath = join(hookDir, "assrt-post-commit.sh");
+  // 2. Install PostToolUse QA reminder hook globally
+  console.error("[2/3] Installing QA reminder hook (global)...");
+  const hookDir = join(home, ".claude", "hooks");
+  const hookPath = join(hookDir, "assrt-qa-reminder.sh");
+  const oldHookPath = join(hookDir, "assrt-post-commit.sh");
   if (!existsSync(hookDir)) mkdirSync(hookDir, { recursive: true });
-  writeFileSync(hookPath, POST_COMMIT_HOOK, { mode: 0o755 });
+  writeFileSync(hookPath, QA_REMINDER_HOOK, { mode: 0o755 });
 
-  // Add hook to project settings
-  const settingsDir = join(cwd, ".claude");
-  const settingsPath = join(settingsDir, "settings.json");
+  // Migrate: remove legacy hook file if it exists
+  if (existsSync(oldHookPath)) {
+    try { unlinkSync(oldHookPath); } catch { /* best effort */ }
+  }
+
+  // Add hook to global settings
+  const settingsPath = join(home, ".claude", "settings.json");
   let settings: Record<string, unknown> = {};
   if (existsSync(settingsPath)) {
     try { settings = JSON.parse(readFileSync(settingsPath, "utf-8")); } catch { /* */ }
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const hooks = (settings.hooks || {}) as Record<string, any>;
-  const postToolUse = (hooks.PostToolUse || []) as Array<Record<string, unknown>>;
+  let postToolUse = (hooks.PostToolUse || []) as Array<Record<string, unknown>>;
 
-  // Check if hook already exists
+  // Migrate: drop any existing entries that reference the legacy hook name
+  const hadLegacy = postToolUse.some((h) => JSON.stringify(h).includes("assrt-post-commit"));
+  if (hadLegacy) {
+    postToolUse = postToolUse.filter((h) => !JSON.stringify(h).includes("assrt-post-commit"));
+  }
+
   const alreadyInstalled = postToolUse.some(
-    (h) => JSON.stringify(h).includes("assrt-post-commit")
+    (h) => JSON.stringify(h).includes("assrt-qa-reminder")
   );
   if (!alreadyInstalled) {
     postToolUse.push({
       matcher: "Bash",
       hooks: [{ type: "command", command: hookPath }],
     });
-    hooks.PostToolUse = postToolUse;
-    settings.hooks = hooks;
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-    console.error(`      Done: hook installed at ${hookPath}\n`);
-  } else {
+  }
+  hooks.PostToolUse = postToolUse;
+  settings.hooks = hooks;
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+  if (hadLegacy) {
+    console.error(`      Done: migrated legacy hook, installed at ${hookPath}\n`);
+  } else if (alreadyInstalled) {
     console.error("      Skipped: hook already installed\n");
+  } else {
+    console.error(`      Done: hook installed at ${hookPath}\n`);
   }
 
-  // 3. Append to CLAUDE.md if not already present
-  console.error("[3/3] Updating CLAUDE.md...");
-  const claudeMdPath = join(cwd, "CLAUDE.md");
+  // 3. Append to global CLAUDE.md if not already present
+  console.error("[3/3] Updating global CLAUDE.md...");
+  const claudeMdPath = join(home, ".claude", "CLAUDE.md");
   let claudeMd = "";
   if (existsSync(claudeMdPath)) {
     claudeMd = readFileSync(claudeMdPath, "utf-8");
@@ -231,15 +252,15 @@ function setupAssrt(): void {
   if (!claudeMd.includes("assrt_test") && !claudeMd.includes("## QA Testing")) {
     const snippet = `\n\n## QA Testing (Assrt)\n\n**CRITICAL: You MUST run \`assrt_test\` after ANY user-facing change.** Do not wait for the user to ask. Do not skip this step. Do not consider a task complete until tests pass.\n\n- **After every UI, route, form, or user flow change**: run \`assrt_test\` against the local dev server to verify it works in a real browser.\n- **New features**: use \`assrt_plan\` to auto-generate test cases, then run them with \`assrt_test\`.\n- **Bug fixes**: write a targeted \`#Case\` that reproduces the bug, run with \`assrt_test\`.\n- **Failed tests**: use \`assrt_diagnose\` to understand root cause before attempting a fix. Do not guess.\n- **Video playback**: \`assrt_test\` records a video of each test run and auto-opens a player in the browser by default (\`autoOpenPlayer: true\`). If the user prefers not to have the video player open automatically, set \`autoOpenPlayer: false\` in subsequent calls.\n`;
     writeFileSync(claudeMdPath, claudeMd + snippet);
-    console.error("      Done: added QA testing section to CLAUDE.md\n");
+    console.error("      Done: added QA testing section to global CLAUDE.md\n");
   } else {
     console.error("      Skipped: CLAUDE.md already has Assrt instructions\n");
   }
 
   console.error("[assrt] Setup complete! Restart Claude Code to activate.\n");
-  console.error("  MCP tools available: assrt_test, assrt_plan, assrt_diagnose");
-  console.error("  Post-commit hook: will suggest testing after git commit/push");
-  console.error("  CLAUDE.md: instructs the agent to test proactively\n");
+  console.error("  MCP tools available globally: assrt_test, assrt_plan, assrt_diagnose");
+  console.error("  QA reminder hook: will suggest testing after git commit/push");
+  console.error("  Global CLAUDE.md: instructs the agent to test proactively\n");
 }
 
 async function main(): Promise<void> {
@@ -301,7 +322,7 @@ async function main(): Promise<void> {
   }
 
   const t0 = Date.now();
-  const agent = new TestAgent(credential.token, emit, args.model, "anthropic", null, "local", credential.type);
+  const agent = new TestAgent(credential.token, emit, args.model, "anthropic", null, "local", credential.type, undefined, args.headed);
   const report = await agent.run(args.url, plan);
 
   await trackEvent("assrt_test_run", {

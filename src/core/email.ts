@@ -115,7 +115,7 @@ export class DisposableEmail {
           code: match[1],
           from: email.from,
           subject: email.subject,
-          body: plainText.slice(0, 500),
+          body: plainText.slice(0, 5000),
         };
       }
     }
@@ -124,7 +124,7 @@ export class DisposableEmail {
       code: "",
       from: email.from,
       subject: email.subject,
-      body: plainText.slice(0, 500),
+      body: plainText.slice(0, 5000),
     };
   }
 }

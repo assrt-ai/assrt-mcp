@@ -90,6 +90,8 @@ if (!window.__pias_cursor_injected) {
 export class McpBrowserManager {
   private client: Client = null;
   private vm: FreestyleVm | null = null;
+  /** When true, close() will NOT destroy the VM — the VM is owned externally. */
+  private vmExternallyManaged = false;
 
   /** Get the screencast WebSocket URL for direct client connection. */
   get screencastUrl(): string | null {
@@ -119,6 +121,32 @@ export class McpBrowserManager {
   /** Directory where Playwright saves the video recording (set by launchLocal). */
   videoDir: string | null = null;
 
+  /**
+   * Connect to an already-running Playwright MCP SSE endpoint without creating
+   * a VM. Used when the caller (e.g. assrt-freestyle) has already provisioned
+   * a VM with Playwright MCP listening locally (e.g. http://localhost:3001/sse)
+   * and just wants assrt to drive that existing browser.
+   *
+   * The caller is responsible for the VM lifecycle; close() will NOT destroy it.
+   */
+  async launchExisting(sseUrl: string): Promise<void> {
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { SSEClientTransport } = await import(
+      "@modelcontextprotocol/sdk/client/sse.js"
+    );
+
+    console.log(JSON.stringify({ event: "browser.mcp.connect_start", mode: "existing", sseUrl, ts: new Date().toISOString() }));
+    const tConn = Date.now();
+    const transport = new SSEClientTransport(new URL(sseUrl));
+    this.client = new Client(
+      { name: "assrt", version: "1.0.0" },
+      { capabilities: {} }
+    );
+    await this.client.connect(transport);
+    this.vmExternallyManaged = true;
+    console.log(JSON.stringify({ event: "browser.mcp.connected", mode: "existing", durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
+  }
+
   /** Launch browser in a remote Freestyle VM (production). */
   async launch(): Promise<void> {
     const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
@@ -140,8 +168,9 @@ export class McpBrowserManager {
 
   /** Launch browser locally via Playwright MCP over stdio (CLI mode).
    *  @param videoDir — Optional directory for Playwright video recording. If provided, a config
-   *  file is written with recordVideo enabled and passed to the MCP server via --config. */
-  async launchLocal(videoDir?: string): Promise<void> {
+   *  file is written with recordVideo enabled and passed to the MCP server via --config.
+   *  @param headed — When true, launch a visible browser window. Defaults to headless. */
+  async launchLocal(videoDir?: string, headed?: boolean): Promise<void> {
     const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
     const { StdioClientTransport } = await import(
       "@modelcontextprotocol/sdk/client/stdio.js"
@@ -160,7 +189,9 @@ export class McpBrowserManager {
     // Use an isolated user-data-dir so assrt's browser doesn't conflict with
     // any other Playwright MCP instance (e.g., the user's Claude Code session)
     const userDataDir = join(tmpdir(), `assrt-browser-${Date.now()}`);
-    const args = [cliPath, "--headless", "--viewport-size", "1600x900", "--user-data-dir", userDataDir];
+    const args = [cliPath, "--viewport-size", "1600x900", "--user-data-dir", userDataDir];
+    if (!headed) args.splice(1, 0, "--headless");
+    console.log(`[browser] launch mode: ${headed ? "headed" : "headless"}`);
 
     // If videoDir is provided, write a temp config file enabling Playwright video recording
     if (videoDir) {
@@ -442,7 +473,7 @@ export class McpBrowserManager {
         console.log(`[browser] video encode failed: ${resp.status} ${text}`);
         return false;
       }
-      const result = await resp.json();
+      const result = (await resp.json()) as { frames?: number; sizeBytes?: number };
       console.log(`[browser] video encoded: ${result.frames} frames, ${result.sizeBytes} bytes`);
       return true;
     } catch (err) {
@@ -488,6 +519,10 @@ export class McpBrowserManager {
         /* */
       }
       this.client = null;
+    }
+    if (this.vmExternallyManaged) {
+      // VM is owned by the caller — do not destroy it.
+      return;
     }
     if (this.vm && !opts?.skipVmDestroy) {
       const vmId = this.vm.vmId;

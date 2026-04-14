@@ -15,13 +15,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { mkdirSync, writeFileSync, readdirSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync } from "fs";
 import { join, basename } from "path";
 import { tmpdir } from "os";
 import { execSync } from "child_process";
 import { getCredential } from "../core/keychain";
 import { TestAgent } from "../core/agent";
 import { McpBrowserManager } from "../core/browser";
+import { fetchScenario, saveScenario, updateScenario, saveScenarioRun, uploadArtifacts, buildCloudUrls } from "../core/scenario-store";
+import { writeScenarioFile, writeResultsFile, readScenarioFile, PATHS } from "../core/scenario-files";
 import type { TestReport } from "../core/types";
 import { trackEvent, shutdownTelemetry } from "../core/telemetry";
 
@@ -105,6 +107,110 @@ document.addEventListener('keydown', e => {
 </html>`;
 }
 
+// ── Persistent video server (single instance, supports Range requests for seeking) ──
+
+let videoServerPort: number | null = null;
+let videoServerInstance: import("http").Server | null = null;
+
+async function ensureVideoServer(): Promise<number> {
+  if (videoServerPort && videoServerInstance) return videoServerPort;
+
+  const http = await import("http");
+  const fs = await import("fs");
+  const pathMod = await import("path");
+  const mime: Record<string, string> = { ".html": "text/html", ".webm": "video/webm", ".mp4": "video/mp4" };
+
+  const srv = http.createServer((req, res) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    const dir = url.searchParams.get("dir");
+
+    // Serve the player HTML (no dir needed for the player itself)
+    if (url.pathname === "/player.html" && dir) {
+      try {
+        const playerPath = pathMod.join(dir, "player.html");
+        const data = fs.readFileSync(playerPath, "utf-8");
+        // Rewrite the video src to include the dir param
+        const videoFiles = fs.readdirSync(dir).filter((f: string) => f.endsWith(".webm"));
+        const rewritten = videoFiles.length > 0
+          ? data.replace(
+              `src="${videoFiles[0]}"`,
+              `src="/video/${encodeURIComponent(videoFiles[0])}?dir=${encodeURIComponent(dir)}"`,
+            )
+          : data;
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(rewritten);
+      } catch {
+        res.writeHead(404);
+        res.end("Player not found");
+      }
+      return;
+    }
+
+    // Serve video files with Range support for seeking
+    if (url.pathname.startsWith("/video/") && dir) {
+      const filename = decodeURIComponent(url.pathname.slice("/video/".length));
+      const filePath = pathMod.join(dir, pathMod.basename(filename));
+      const ext = pathMod.extname(filePath).toLowerCase();
+      const contentType = mime[ext] || "application/octet-stream";
+
+      let stat: ReturnType<typeof fs.statSync>;
+      try {
+        stat = fs.statSync(filePath);
+      } catch {
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
+
+      const rangeHeader = req.headers.range;
+      if (rangeHeader) {
+        const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+        if (match) {
+          const start = parseInt(match[1], 10);
+          const end = match[2] ? parseInt(match[2], 10) : stat.size - 1;
+          if (start >= stat.size) {
+            res.writeHead(416, { "Content-Range": `bytes */${stat.size}` });
+            res.end();
+            return;
+          }
+          const clampedEnd = Math.min(end, stat.size - 1);
+          res.writeHead(206, {
+            "Content-Range": `bytes ${start}-${clampedEnd}/${stat.size}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": clampedEnd - start + 1,
+            "Content-Type": contentType,
+          });
+          fs.createReadStream(filePath, { start, end: clampedEnd }).pipe(res);
+          return;
+        }
+      }
+
+      // Full response
+      res.writeHead(200, {
+        "Content-Length": stat.size,
+        "Content-Type": contentType,
+        "Accept-Ranges": "bytes",
+      });
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end("Not found");
+  });
+
+  await new Promise<void>((resolve) => {
+    srv.listen(0, "127.0.0.1", () => {
+      videoServerPort = (srv.address() as { port: number }).port;
+      videoServerInstance = srv;
+      console.error(`[assrt-mcp] Video player server started on port ${videoServerPort}`);
+      resolve();
+    });
+  });
+  // Keep alive for the lifetime of the MCP process (no timeout, no unref)
+  return videoServerPort!;
+}
+
 // ── Plan generation prompt (reused from web app) ──
 
 const PLAN_SYSTEM_PROMPT = `You are a Senior QA Engineer generating test cases for an AI browser agent. The agent can: navigate URLs, click buttons/links by text or selector, type into inputs, scroll, press keys, and make assertions. It CANNOT: resize the browser, test network errors, inspect CSS, or run JavaScript.
@@ -158,6 +264,10 @@ const DIAGNOSE_SYSTEM_PROMPT = `You are a senior QA engineer and debugging exper
 - If the test steps are valid but the app is broken, focus on the app issue
 - Keep it concise and actionable — no filler`;
 
+// ── State: last recorded video path (set by assrt_test, read by assrt_analyze_video) ──
+
+let lastVideoFile: string | null = null;
+
 // ── Server setup ──
 
 const SERVER_INSTRUCTIONS = `You are connected to Assrt, an AI-powered QA testing server that runs real browser tests against web applications.
@@ -172,15 +282,25 @@ const SERVER_INSTRUCTIONS = `You are connected to Assrt, an AI-powered QA testin
 
 ## How to use the tools
 
-- **assrt_test**: The primary tool. Pass a URL (usually http://localhost:3000 or whatever the dev server is) and a test plan. Returns structured pass/fail results with screenshots showing the browser at each step.
+- **assrt_test**: The primary tool. Pass a URL and either a \`plan\` (text) or a \`scenarioId\` (UUID from a previous run). Returns structured pass/fail results with screenshots.
 - **assrt_plan**: Use when you need test cases but don't have them. Navigates to the URL, analyzes the page, and generates executable test scenarios.
 - **assrt_diagnose**: Use after a failed test. Pass the URL, the scenario that failed, and the error. Returns root cause analysis and a corrected test.
+
+## Scenario files
+
+After \`assrt_test\` runs, the test plan is saved to \`/tmp/assrt/scenario.md\` and results to \`/tmp/assrt/results/latest.json\`. You can:
+- **Read** \`/tmp/assrt/scenario.md\` to see the current plan
+- **Edit** \`/tmp/assrt/scenario.md\` to modify test cases; changes auto-sync to cloud storage
+- **Read** \`/tmp/assrt/results/latest.json\` to review the last run's results
+- **Read** \`/tmp/assrt/scenario.json\` for scenario metadata (ID, name, URL)
+
+Every test run is auto-saved with a unique scenario ID (UUID). Use this ID to re-run the same scenario later: \`assrt_test({url, scenarioId: "..."})\`.
 
 ## Important
 
 - Always include the correct local dev server URL. Check package.json scripts or running processes to find it.
 - Test plans use \`#Case N: name\` format. Each case should be self-contained (3-5 steps).
-- The browser runs headless at 1280x720. Screenshots are returned as images in the response.
+- The browser runs headless by default at 1600x900. Pass \`headed: true\` to \`assrt_test\` (or set \`ASSRT_HEADED=1\`) to launch a visible browser window, useful when debugging a failing test locally. Screenshots are returned as images in the response.
 - If the dev server is not running, start it first before calling assrt_test.`;
 
 const server = new McpServer(
@@ -195,16 +315,66 @@ server.tool(
   "Run AI-powered QA test scenarios against a URL. Returns a structured report with pass/fail results, assertions, and improvement suggestions.",
   {
     url: z.string().describe("URL to test (e.g. http://localhost:3000)"),
-    plan: z.string().describe("Test scenarios in text format. Use #Case N: format for multiple scenarios."),
+    plan: z.string().optional().describe("Test scenarios in text format. Use #Case N: format for multiple scenarios. Either plan or scenarioId is required."),
+    scenarioId: z.string().optional().describe("Load a saved scenario by its UUID instead of providing plan text. Get this ID from a previous assrt_test run or the Assrt web app."),
+    scenarioName: z.string().optional().describe("Human-readable name for saving this scenario (e.g. 'checkout flow'). Used when auto-saving new scenarios."),
     model: z.string().optional().describe("LLM model override (default: claude-haiku-4-5-20251001)"),
     autoOpenPlayer: z.boolean().optional().describe("Auto-open the video player in the browser when test completes (default: true)"),
+    headed: z.boolean().optional().describe("Launch a visible (headed) browser window instead of headless. Defaults to headless, or the ASSRT_HEADED env var if set."),
   },
-  async ({ url, plan, model, autoOpenPlayer }) => {
+  async ({ url, plan, scenarioId, scenarioName, model, autoOpenPlayer, headed }) => {
+    // Resolve the plan: either from scenarioId or directly from plan param
+    let resolvedPlan: string;
+    let resolvedScenarioId = scenarioId;
+
+    if (scenarioId && plan) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Provide either plan or scenarioId, not both." }) }] };
+    }
+
+    if (scenarioId) {
+      const stored = await fetchScenario(scenarioId);
+      if (!stored) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Scenario ${scenarioId} not found.` }) }] };
+      }
+      resolvedPlan = stored.plan;
+      console.error(`[assrt_test] Loaded scenario ${scenarioId.slice(0, 8)}... (${stored.name || "unnamed"})`);
+    } else if (plan) {
+      resolvedPlan = plan;
+    } else {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Either plan or scenarioId is required." }) }] };
+    }
+
+    // Write scenario to disk so the agent can read/edit it via file tools
+    writeScenarioFile(resolvedPlan, {
+      id: resolvedScenarioId || "unsaved",
+      name: scenarioName,
+      url,
+    });
+
     const shouldAutoOpen = autoOpenPlayer !== false;
+    const autoSave = !process.env.ASSRT_NO_SAVE;
     const credential = getCredential();
 
-    // Create a temp directory for this test run's artifacts
-    const runId = new Date().toISOString().replace(/[:.]/g, "-");
+    // Pre-flight: create scenario UUID BEFORE test execution so cloud URLs are deterministic
+    if (autoSave && !resolvedScenarioId) {
+      try {
+        resolvedScenarioId = await saveScenario({
+          plan: resolvedPlan,
+          name: scenarioName,
+          url,
+          createdFrom: "mcp",
+        });
+        // Rewrite scenario file with real ID so fs.watch syncs correctly
+        writeScenarioFile(resolvedPlan, { id: resolvedScenarioId, name: scenarioName, url });
+        console.error(`[assrt_test] Pre-saved scenario as ${resolvedScenarioId.slice(0, 8)}...`);
+      } catch (err) {
+        console.error("[assrt_test] Pre-save failed:", (err as Error).message);
+      }
+    }
+
+    // Generate a stable run ID upfront for deterministic cloud URLs
+    const crypto = await import("crypto");
+    const runId = crypto.randomUUID();
     const runDir = join(tmpdir(), "assrt", runId);
     const screenshotDir = join(runDir, "screenshots");
     mkdirSync(screenshotDir, { recursive: true });
@@ -274,8 +444,14 @@ server.tool(
 
     const t0 = Date.now();
     const videoDir = join(runDir, "video");
-    const agent = new TestAgent(credential.token, emit, model, "anthropic", null, "local", credential.type, videoDir);
-    const report: TestReport = await agent.run(url, plan);
+    // Auto-select mode: if ASSRT_PLAYWRIGHT_SSE_URL is set (VM embedded mode),
+    // connect to the existing Playwright MCP rather than spawning a local one.
+    const agentMode: "local" | "existing" = process.env.ASSRT_PLAYWRIGHT_SSE_URL
+      ? "existing"
+      : "local";
+    const headedResolved = headed ?? (process.env.ASSRT_HEADED === "1" || process.env.ASSRT_HEADED === "true");
+    const agent = new TestAgent(credential.token, emit, model, "anthropic", null, agentMode, credential.type, videoDir, headedResolved);
+    const report: TestReport = await agent.run(url, resolvedPlan);
 
     // Close the browser so Playwright finalizes the video recording
     await agent.close();
@@ -297,6 +473,7 @@ server.tool(
       const videoFiles = readdirSync(videoDir).filter((f) => f.endsWith(".webm"));
       if (videoFiles.length > 0) {
         videoFile = join(videoDir, videoFiles[0]);
+        lastVideoFile = videoFile;
         // Generate a self-contained HTML player alongside the video
         videoPlayerFile = join(videoDir, "player.html");
         writeFileSync(videoPlayerFile, generateVideoPlayerHtml(
@@ -306,38 +483,13 @@ server.tool(
           report.failedCount,
           +(report.totalDuration / 1000).toFixed(1),
         ));
-        // Serve the video directory over HTTP (browsers block file:// video loading)
+        // Serve video via the persistent video server
         try {
-          const http = await import("http");
-          const fs = await import("fs");
-          const path = await import("path");
-          const srv = http.createServer((req, res) => {
-            const filePath = join(videoDir, path.basename(req.url || "/"));
-            const ext = path.extname(filePath).toLowerCase();
-            const mime: Record<string, string> = { ".html": "text/html", ".webm": "video/webm", ".mp4": "video/mp4" };
-            try {
-              const data = fs.readFileSync(filePath);
-              res.writeHead(200, { "Content-Type": mime[ext] || "application/octet-stream" });
-              res.end(data);
-            } catch {
-              res.writeHead(404);
-              res.end("Not found");
-            }
-          });
-          // Wait for server to be ready and capture the URL
-          await new Promise<void>((resolve) => {
-            srv.listen(0, "127.0.0.1", () => {
-              const port = (srv.address() as { port: number }).port;
-              videoPlayerUrl = `http://127.0.0.1:${port}/player.html`;
-              if (shouldAutoOpen) {
-                try { execSync(`open "${videoPlayerUrl}"`); } catch { /* best effort */ }
-              }
-              // Auto-shutdown after 10 minutes
-              setTimeout(() => { try { srv.close(); } catch {} }, 600_000).unref();
-              resolve();
-            });
-          });
-          srv.unref();
+          const port = await ensureVideoServer();
+          videoPlayerUrl = `http://127.0.0.1:${port}/player.html?dir=${encodeURIComponent(videoDir)}`;
+          if (shouldAutoOpen) {
+            try { execSync(`open "${videoPlayerUrl}"`); } catch { /* best effort */ }
+          }
         } catch { /* best effort */ }
       }
     } catch { /* no video directory or no files */ }
@@ -376,10 +528,78 @@ server.tool(
     }));
     summary.screenshots = screenshotFiles;
 
+    // Build deterministic cloud URLs (available immediately, artifacts upload in background)
+    if (resolvedScenarioId && !resolvedScenarioId.startsWith("local-")) {
+      const artifactNames: { video?: string; screenshots?: string[]; log?: string } = {};
+      if (videoFile) artifactNames.video = basename(videoFile);
+      if (screenshotFiles.length > 0) artifactNames.screenshots = screenshotFiles.map((s) => basename(s.file));
+      artifactNames.log = "execution.log";
+
+      const cloudUrls = buildCloudUrls(resolvedScenarioId, runId, artifactNames);
+      summary.cloudUrls = cloudUrls;
+    }
+
+    // Write results to a well-known file so the agent can access them
+    const { latestPath, runPath } = writeResultsFile(runId, summary);
+    summary.resultsFile = latestPath;
+    summary.runResultsFile = runPath;
+
+    // Include scenario file paths so the agent knows where to find/edit the plan
+    summary.scenarioFile = PATHS.scenarioFile;
+    summary.scenarioMetaFile = PATHS.scenarioMeta;
+
+    // Re-read the scenario file in case the agent edited it during the run
+    const currentPlan = readScenarioFile();
+    if (currentPlan && currentPlan !== resolvedPlan) {
+      console.error("[assrt_test] Scenario was edited during run, using updated plan for save");
+      resolvedPlan = currentPlan;
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const content: any[] = [
       { type: "text", text: JSON.stringify(summary, null, 2) },
     ];
+
+    // Attach scenarioId to summary
+    if (resolvedScenarioId) {
+      summary.scenarioId = resolvedScenarioId;
+    }
+
+    // Async: save run result and upload artifacts to central storage (fire and forget)
+    if (resolvedScenarioId && !resolvedScenarioId.startsWith("local-")) {
+      // If the plan was edited during the run, update the saved scenario
+      if (currentPlan && currentPlan !== resolvedPlan) {
+        updateScenario(resolvedScenarioId, { plan: resolvedPlan }).catch((err) =>
+          console.error("[assrt_test] Async scenario update failed:", (err as Error).message)
+        );
+      }
+
+      // Save run record
+      saveScenarioRun(resolvedScenarioId, {
+        planSnapshot: resolvedPlan,
+        url,
+        model: model || "claude-haiku-4-5-20251001",
+        status: report.failedCount === 0 ? "passed" : "failed",
+        passedCount: report.passedCount,
+        failedCount: report.failedCount,
+        totalDuration: report.totalDuration,
+        reportJson: summary,
+      }).then((savedRunId) => {
+        // Upload artifacts in background after run is saved
+        if (!savedRunId) return;
+        const files: Array<{ name: string; path: string; type: string }> = [];
+        if (videoFile) files.push({ name: basename(videoFile), path: videoFile, type: "video/webm" });
+        if (logFile) files.push({ name: "execution.log", path: logFile, type: "text/plain" });
+        for (const ss of screenshotFiles) {
+          files.push({ name: basename(ss.file), path: ss.file, type: "image/png" });
+        }
+        if (files.length > 0) {
+          uploadArtifacts(resolvedScenarioId!, savedRunId, files).catch((err) =>
+            console.error("[assrt_test] Artifact upload failed:", (err as Error).message)
+          );
+        }
+      }).catch((err) => console.error("[assrt_test] Async run save failed:", (err as Error).message));
+    }
 
     trackEvent("assrt_test_run", {
       url,
@@ -390,6 +610,7 @@ server.tool(
       duration_s: +((Date.now() - t0) / 1000).toFixed(1),
       screenshotCount: screenshots.length,
       scenarioCount: report.scenarios.length,
+      scenarioId: resolvedScenarioId?.slice(0, 8),
       source: "mcp",
     });
 
@@ -418,8 +639,14 @@ server.tool(
 
     const browser = new McpBrowserManager();
     try {
-      server.server.sendLoggingMessage({ level: "info", data: "Launching local browser..." });
-      await browser.launchLocal();
+      const existingSseUrl = process.env.ASSRT_PLAYWRIGHT_SSE_URL;
+      if (existingSseUrl) {
+        server.server.sendLoggingMessage({ level: "info", data: `Connecting to existing Playwright MCP at ${existingSseUrl}...` });
+        await browser.launchExisting(existingSseUrl);
+      } else {
+        server.server.sendLoggingMessage({ level: "info", data: "Launching local browser..." });
+        await browser.launchLocal();
+      }
 
       server.server.sendLoggingMessage({ level: "info", data: `Navigating to ${url}...` });
       await browser.navigate(url);
@@ -555,6 +782,101 @@ Please diagnose this failure and provide a corrected test scenario.`;
     };
   }
 );
+
+// ── Tool: assrt_analyze_video (only registered when GEMINI_API_KEY is available) ──
+
+const GEMINI_VIDEO_MODEL = "gemini-3.1-flash-lite-preview";
+
+if (process.env.GEMINI_API_KEY) {
+  server.tool(
+    "assrt_analyze_video",
+    "Analyze the most recent test recording video using Gemini vision. Ask questions about what happened during the test, verify visual states, or get a summary of the browser session.",
+    {
+      prompt: z.string().describe("What to analyze in the video (e.g. 'Did the login form appear?', 'Summarize what happened', 'Was there a visual error?')"),
+      videoPath: z.string().optional().describe("Path to a specific .webm video file. If omitted, uses the most recent assrt_test recording."),
+    },
+    async ({ prompt, videoPath }) => {
+      const apiKey = process.env.GEMINI_API_KEY!;
+      const filePath = videoPath || lastVideoFile;
+
+      if (!filePath) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: "No video available. Run assrt_test first to record a test session, or provide a videoPath." }),
+          }],
+          isError: true,
+        };
+      }
+
+      let videoBuffer: Buffer;
+      try {
+        videoBuffer = readFileSync(filePath);
+      } catch {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: `Could not read video file: ${filePath}` }),
+          }],
+          isError: true,
+        };
+      }
+
+      const videoBase64 = videoBuffer.toString("base64");
+      const { GoogleGenAI } = await import("@google/genai");
+      const genai = new GoogleGenAI({ apiKey });
+
+      try {
+        const response = await genai.models.generateContent({
+          model: GEMINI_VIDEO_MODEL,
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: "video/webm",
+                    data: videoBase64,
+                  },
+                },
+                { text: prompt },
+              ],
+            },
+          ],
+        });
+
+        const analysis = response.text ?? "";
+
+        trackEvent("assrt_analyze_video", {
+          prompt: prompt.slice(0, 200),
+          videoPath: filePath,
+          source: "mcp",
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ analysis, videoPath: filePath }),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: `Gemini API error: ${err instanceof Error ? err.message : "unknown error"}`,
+              videoPath: filePath,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+  console.error("[assrt-mcp] assrt_analyze_video tool registered (GEMINI_API_KEY found)");
+} else {
+  console.error("[assrt-mcp] assrt_analyze_video tool skipped (GEMINI_API_KEY not set)");
+}
 
 // ── Start ──
 

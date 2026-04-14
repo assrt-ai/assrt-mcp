@@ -4,7 +4,7 @@ import { McpBrowserManager } from "./browser";
 import { DisposableEmail } from "./email";
 import type { TestStep, TestAssertion, ScenarioResult, TestReport } from "./types";
 
-const MAX_STEPS_PER_SCENARIO = 60;
+const MAX_STEPS_PER_SCENARIO = Infinity;
 const MAX_CONVERSATION_TURNS = Infinity;
 const DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
 const DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview";
@@ -231,9 +231,9 @@ When you encounter a login/signup form that requires an email:
 2. Use THAT email in the signup form
 3. After submitting, call wait_for_verification_code for the OTP
 4. Enter the verification code into the form
-   - If the code input is split across multiple single-character fields (common OTP pattern), do NOT type into each field individually. Instead, find the parent container of the input fields in the snapshot (the generic element that wraps all the textboxes), then use evaluate on that container to dispatch a paste event:
-     \`(el) => { const dt = new DataTransfer(); dt.setData('text/plain', 'CODE_HERE'); el.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true})); return 'pasted'; }\`
-     Pass the container's ref to evaluate so it receives the element. Replace CODE_HERE with the actual code. Then call snapshot to verify all digits filled correctly. This is MUCH faster than typing into 6 fields one at a time.
+   - IMPORTANT: If the code input is split across multiple single-character fields (common OTP pattern), you MUST use evaluate to paste all digits at once. Do NOT type into each field one by one. Call evaluate with EXACTLY this expression (only replace CODE_HERE with the actual code):
+     \`() => { const inp = document.querySelector('input[maxlength="1"]'); if (!inp) return 'no otp input found'; const c = inp.parentElement; const dt = new DataTransfer(); dt.setData('text/plain', 'CODE_HERE'); c.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true})); return 'pasted ' + document.querySelectorAll('input[maxlength="1"]').length + ' fields'; }\`
+     Do NOT modify this expression except to replace CODE_HERE. Do NOT use ref attributes as DOM selectors (they don't exist in the DOM). After evaluate returns "pasted", call snapshot to verify all digits filled, then click Verify.
 
 ## Scenario Continuity
 - Scenarios run in the SAME browser session
@@ -300,7 +300,7 @@ const GEMINI_FUNCTION_DECLARATIONS = TOOLS.map((t) => ({
   },
 }));
 
-export type AgentMode = "local" | "remote";
+export type AgentMode = "local" | "remote" | "existing";
 
 export class TestAgent {
   private anthropic: Anthropic | null = null;
@@ -331,14 +331,17 @@ export class TestAgent {
    */
   /** Directory for video recording output. Only used in local mode. */
   private videoDir: string | null = null;
+  /** When true, launches a headed (visible) browser in local mode. */
+  private headed = false;
 
-  constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth", videoDir?: string) {
+  constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth", videoDir?: string, headed?: boolean) {
     this.provider = (provider === "gemini" ? "gemini" : "anthropic") as Provider;
     this.browser = new McpBrowserManager();
     this.emit = emit;
     this.broadcastFrame = broadcastFrame || null;
     this.mode = mode || "remote";
     this.videoDir = videoDir || null;
+    this.headed = !!headed;
 
     if (this.provider === "gemini") {
       this.gemini = new GoogleGenAI({ apiKey });
@@ -361,7 +364,14 @@ export class TestAgent {
     console.log(JSON.stringify({ event: "agent.run.start", url, mode: this.mode, model: this.model, ts: new Date().toISOString() }));
     if (this.mode === "local") {
       this.emit("status", { message: "Launching local browser..." });
-      await this.browser.launchLocal(this.videoDir || undefined);
+      await this.browser.launchLocal(this.videoDir || undefined, this.headed);
+    } else if (this.mode === "existing") {
+      const sseUrl = process.env.ASSRT_PLAYWRIGHT_SSE_URL;
+      if (!sseUrl) {
+        throw new Error("mode=existing requires ASSRT_PLAYWRIGHT_SSE_URL env var");
+      }
+      this.emit("status", { message: `Connecting to existing Playwright MCP at ${sseUrl}...` });
+      await this.browser.launchExisting(sseUrl);
     } else {
       this.emit("status", { message: "Provisioning cloud browser VM..." });
       await this.browser.launch();
@@ -800,7 +810,7 @@ export class TestAgent {
               else {
                 const latest = msgs[msgs.length - 1];
                 const body = (latest.body_text || latest.body_html || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
-                result = `${msgs.length} email(s). Latest from: ${latest.from} | Subject: ${latest.subject}\nBody: ${body.slice(0, 500)}`;
+                result = `${msgs.length} email(s). Latest from: ${latest.from} | Subject: ${latest.subject}\nBody: ${body.slice(0, 5000)}`;
               }
               stepDescription = `Check inbox (${msgs.length} emails)`;
               stepAction = "email";

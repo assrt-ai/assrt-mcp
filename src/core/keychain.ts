@@ -29,10 +29,17 @@ export interface AuthCredential {
  * Users must have Claude Code installed and logged in.
  */
 export function getCredential(): AuthCredential {
+  // Prefer explicit API key env var when set — works on any platform
+  // (Linux VMs, CI, etc.) without requiring a macOS keychain.
+  const envKey = process.env.ANTHROPIC_API_KEY;
+  if (envKey) {
+    console.error("[auth] Using ANTHROPIC_API_KEY env var");
+    return { token: envKey, type: "apiKey" };
+  }
+
   if (process.platform !== "darwin") {
     throw new Error(
-      "Assrt CLI currently requires macOS with Claude Code installed.\n" +
-      "Log in to Claude Code (`claude` in terminal) to store credentials in Keychain."
+      "No credentials found. Set ANTHROPIC_API_KEY, or run on macOS with Claude Code installed."
     );
   }
 
@@ -49,13 +56,6 @@ export function getCredential(): AuthCredential {
     }
   } catch {
     // Keychain entry not found or parse failed
-  }
-
-  // Fall back to ANTHROPIC_API_KEY env var
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey) {
-    console.error("[auth] Using ANTHROPIC_API_KEY env var");
-    return { token: apiKey, type: "apiKey" };
   }
 
   throw new Error(

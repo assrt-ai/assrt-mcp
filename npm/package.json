@@ -1,8 +1,17 @@
 {
   "name": "@assrt-ai/assrt",
-  "version": "0.4.0",
+  "version": "0.4.1-beta.8",
   "description": "AI-powered QA testing from the command line and as an MCP server for coding agents",
-  "keywords": ["testing", "qa", "ai", "mcp", "playwright", "browser", "claude", "automation"],
+  "keywords": [
+    "testing",
+    "qa",
+    "ai",
+    "mcp",
+    "playwright",
+    "browser",
+    "claude",
+    "automation"
+  ],
   "license": "MIT",
   "author": "Assrt <matt@assrt.ai>",
   "repository": {
