@@ -34,6 +34,18 @@ export interface TestReport {
   generatedAt: string;
 }
 
+/** Options passed from the MCP tool to the test agent */
+export interface TestRunOptions {
+  /** Explicit pass/fail criteria the agent must evaluate */
+  passCriteria?: string;
+  /** Key/value variables for parameterized tests (e.g. test email, product SKU) */
+  variables?: Record<string, string>;
+  /** Max seconds before the test run is aborted */
+  timeout?: number;
+  /** Viewport preset or explicit dimensions */
+  viewport?: string | { width: number; height: number };
+}
+
 export type SSEEventType =
   | "step"
   | "screenshot"
