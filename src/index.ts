@@ -16,5 +16,3 @@ export type {
 } from "./core/types";
 export { getCredential } from "./core/keychain";
 export { trackEvent, shutdownTelemetry } from "./core/telemetry";
-export { createTestVm, destroyTestVm, isFreestyleConfigured } from "./core/freestyle";
-export type { FreestyleVm } from "./core/freestyle";
