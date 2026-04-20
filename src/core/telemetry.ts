@@ -9,9 +9,36 @@
 
 import { createHash } from "crypto";
 import { hostname, platform, arch, userInfo } from "os";
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 const POSTHOG_KEY = "phc_mS27BrT7FC5m3BiVjDj9T4iOpVY9Oh1PB3g3bHsEiQv";
 const POSTHOG_HOST = "https://us.i.posthog.com";
+
+// Resolve version from the nearest package.json at runtime.
+// Walks up from this file's directory so it works from both dist/ and npm/.
+let cachedVersion: string | null = null;
+function getVersion(): string {
+  if (cachedVersion) return cachedVersion;
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 6; i++) {
+      try {
+        const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8"));
+        if (typeof pkg.version === "string" && (pkg.name === "@assrt-ai/assrt" || pkg.name === "assrt-sdk")) {
+          cachedVersion = pkg.version;
+          return cachedVersion;
+        }
+      } catch { /* keep walking */ }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch { /* */ }
+  cachedVersion = "unknown";
+  return cachedVersion;
+}
 
 function isEnabled(): boolean {
   if (process.env.DO_NOT_TRACK === "1") return false;
@@ -112,7 +139,7 @@ export async function trackEvent(event: string, props: Partial<TestEventProps> &
       properties: {
         ...rest,
         domain: url ? getDomain(url as string) : undefined,
-        version: "0.3.1",
+        version: getVersion(),
         os: platform(),
         arch: arch(),
         node_version: process.version,
