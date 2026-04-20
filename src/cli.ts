@@ -94,6 +94,10 @@ function parseArgs(argv: string[]): {
       args["no-auto-open"] = true;
       continue;
     }
+    if (arg === "--postinstall") {
+      args.postinstall = true;
+      continue;
+    }
     if (arg.startsWith("--") && i + 1 < argv.length) {
       args[arg.slice(2)] = argv[++i];
     }
@@ -430,8 +434,21 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.command === "setup") {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    const markerPath = join(home, ".assrt", "installed");
+    const firstInstall = !existsSync(markerPath);
+    const postinstall = process.argv.includes("--postinstall");
+
     setupAssrt();
-    await trackEvent("assrt_setup", { source: "cli" });
+
+    if (firstInstall) {
+      try {
+        mkdirSync(join(home, ".assrt"), { recursive: true });
+        writeFileSync(markerPath, new Date().toISOString());
+      } catch { /* best effort */ }
+      await trackEvent("assrt_installed", { source: "cli", postinstall });
+    }
+    await trackEvent("assrt_setup", { source: "cli", postinstall, firstInstall });
     await shutdownTelemetry();
     return;
   }
