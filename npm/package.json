@@ -1,6 +1,6 @@
 {
   "name": "@assrt-ai/assrt",
-  "version": "0.4.3-beta.5",
+  "version": "0.4.3",
   "description": "AI-powered QA testing from the command line and as an MCP server for coding agents",
   "keywords": [
     "testing",
@@ -40,7 +40,7 @@
     "chunk-*.mjs"
   ],
   "scripts": {
-    "postinstall": "node cli.mjs setup 2>/dev/null || true"
+    "postinstall": "node cli.mjs setup --postinstall 2>/dev/null || true"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
