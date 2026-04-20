@@ -140,58 +140,74 @@ export class McpBrowserManager {
   private transport: any = null;
 
   /**
-   * Kill any orphan Chrome/Playwright processes that are using a given user-data-dir.
-   * This prevents multiple Chrome instances from fighting over the same profile
-   * when a previous assrt session crashed or timed out without cleanup.
+   * Collect every PID associated with a given user-data-dir, from two sources:
+   *  1. `ps` scan for processes with `--user-data-dir=<path>` in their command line.
+   *  2. The SingletonLock symlink inside the profile (encodes `hostname-PID`), in
+   *     case `ps` parsing missed the main Chrome (observed on macOS occasionally).
+   *  Also walks up to include Playwright-MCP parents so the whole spawn chain dies.
    */
-  static async killOrphanChromeProcesses(userDataDir: string): Promise<void> {
+  private static async collectProfilePids(userDataDir: string): Promise<number[]> {
+    const { execSync } = await import("child_process");
+    const { readlinkSync } = await import("fs");
+    const { join } = await import("path");
+    const pids = new Set<number>();
+
     try {
-      const { execSync } = await import("child_process");
-      // Find all Chrome processes using this specific user-data-dir
       const psOutput = execSync(
         `ps aux | grep -E "user-data-dir.*${userDataDir.replace(/\//g, "\\/")}" | grep -v grep || true`,
         { encoding: "utf-8", timeout: 5000 }
       ).trim();
-
-      if (!psOutput) return;
-
-      const pids: number[] = [];
-      for (const line of psOutput.split("\n")) {
-        const parts = line.trim().split(/\s+/);
-        const pid = parseInt(parts[1], 10);
-        if (pid && !isNaN(pid)) pids.push(pid);
+      for (const line of psOutput.split("\n").filter(Boolean)) {
+        const pid = parseInt(line.trim().split(/\s+/)[1], 10);
+        if (pid && !isNaN(pid)) pids.add(pid);
       }
+    } catch { /* ignore */ }
 
-      if (pids.length === 0) return;
+    try {
+      const target = readlinkSync(join(userDataDir, "SingletonLock"));
+      const lockPid = parseInt(target.split("-").pop() || "", 10);
+      if (lockPid && !isNaN(lockPid)) pids.add(lockPid);
+    } catch { /* no lock */ }
 
-      console.error(`[browser] found ${pids.length} orphan Chrome process(es) using ${userDataDir}: ${pids.join(", ")}`);
+    for (const pid of [...pids]) {
+      try {
+        const ppid = parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf-8", timeout: 3000 }).trim(), 10);
+        if (ppid && !isNaN(ppid) && ppid > 1) {
+          const parentCmd = execSync(`ps -o command= -p ${ppid}`, { encoding: "utf-8", timeout: 3000 }).trim();
+          if (parentCmd.includes("playwright")) pids.add(ppid);
+        }
+      } catch { /* parent may already be gone */ }
+    }
+    return [...pids];
+  }
 
-      // Also find any Playwright MCP parent processes that spawned these Chrome instances
-      for (const chromePid of [...pids]) {
-        try {
-          const ppidOut = execSync(`ps -o ppid= -p ${chromePid}`, { encoding: "utf-8", timeout: 3000 }).trim();
-          const ppid = parseInt(ppidOut, 10);
-          if (ppid && !isNaN(ppid) && ppid > 1) {
-            // Check if the parent is a playwright-mcp process
-            const parentCmd = execSync(`ps -o command= -p ${ppid}`, { encoding: "utf-8", timeout: 3000 }).trim();
-            if (parentCmd.includes("playwright") && !pids.includes(ppid)) {
-              pids.push(ppid);
-              console.error(`[browser] also killing Playwright MCP parent (pid=${ppid})`);
-            }
-          }
-        } catch { /* parent may already be gone */ }
+  /**
+   * Kill every Chrome/Playwright process pinned to `userDataDir`, unconditionally.
+   * Called from the full-launch path where `this.client` is null — by definition
+   * we own nothing on that profile, so anything on it is an orphan regardless of
+   * age or liveness. Retries once if the profile is still occupied after the first
+   * sweep (covers races where a child respawns, or `ps` missed a process).
+   */
+  static async killOrphanChromeProcesses(userDataDir: string): Promise<void> {
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const pids = await McpBrowserManager.collectProfilePids(userDataDir);
+        if (pids.length === 0) return;
+
+        console.error(`[browser] attempt ${attempt + 1}: killing ${pids.length} process(es) pinned to ${userDataDir}: ${pids.join(", ")}`);
+        for (const pid of pids) {
+          try {
+            process.kill(pid, "SIGKILL");
+            console.error(`[browser] killed pid=${pid}`);
+          } catch { /* already dead */ }
+        }
+        // Let the OS reap zombies and release file locks before re-checking.
+        await new Promise((r) => setTimeout(r, 750));
       }
-
-      // Kill all orphan processes
-      for (const pid of pids) {
-        try {
-          process.kill(pid, "SIGKILL");
-          console.error(`[browser] killed orphan process pid=${pid}`);
-        } catch { /* already dead */ }
+      const remaining = await McpBrowserManager.collectProfilePids(userDataDir);
+      if (remaining.length > 0) {
+        console.error(`[browser] WARNING: ${remaining.length} process(es) still pinned after 2 sweeps: ${remaining.join(", ")}`);
       }
-
-      // Brief pause to let OS release file locks
-      await new Promise((r) => setTimeout(r, 500));
     } catch (err) {
       console.error(`[browser] orphan cleanup error (non-fatal):`, err);
     }
@@ -240,12 +256,19 @@ export class McpBrowserManager {
 
   /** @returns true if an existing browser was reused, false if a new one was launched. */
   async launchLocal(videoDir?: string, headed?: boolean, isolated?: boolean, extension?: boolean, extensionToken?: string): Promise<boolean> {
-    // Reuse existing browser connection if still alive
+    // Reuse existing browser connection only if it's actually responsive.
+    // A stale client (e.g. the spawning subprocess died, or Chrome wedged on
+    // about:blank) would otherwise cause snapshots against a dead page.
     if (this.client) {
-      console.error("[browser] reusing existing browser connection");
-      // Update videoDir for this run if provided
-      if (videoDir) this.videoDir = videoDir;
-      return true;
+      if (await this.isAlive()) {
+        console.error("[browser] reusing existing browser connection (health check passed)");
+        if (videoDir) this.videoDir = videoDir;
+        return true;
+      }
+      console.error("[browser] existing client failed health check — tearing down and relaunching");
+      try { await this.client.close(); } catch { /* already dead */ }
+      this.client = null;
+      this.transport = null;
     }
 
     const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
