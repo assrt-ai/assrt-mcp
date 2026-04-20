@@ -381,6 +381,14 @@ export class TestAgent {
     }
 
     console.error(JSON.stringify({ event: "agent.run.start", url, mode: this.mode, model: this.model, hasPassCriteria: !!passCriteria, variableCount: variables ? Object.keys(variables).length : 0, ts: new Date().toISOString() }));
+
+    // Preflight: probe the target URL before burning time on Chrome launch.
+    // A wedged dev server will otherwise hang navigate() for minutes and then
+    // surface as an opaque "MCP client not connected" after the kernel kills
+    // the connection. Fail fast with an actionable error.
+    this.emit("status", { message: `Checking ${url}...` });
+    await this.preflightUrl(url);
+
     let browserReused = false;
     this.emit("status", { message: this.extension ? "Connecting to existing Chrome..." : "Launching local browser..." });
     browserReused = await this.browser.launchLocal(this.videoDir || undefined, this.headed, this.isolated, this.extension, this.extensionToken);
@@ -425,18 +433,28 @@ export class TestAgent {
       this.emit("vm_id", { vmId });
     }
 
-    // When reusing an existing browser session, skip the initial navigation
-    // so the agent continues from the current page state.
-    if (!browserReused) {
-      const tNav = Date.now();
-      await this.browser.navigate(url);
-      console.error(JSON.stringify({ event: "agent.navigate.done", url, durationMs: Date.now() - tNav, ts: new Date().toISOString() }));
-      this.emit("status", { message: `Navigated to ${url}` });
-      this.queueDiscoverPage(url);
-    } else {
-      console.error(JSON.stringify({ event: "agent.browser.reused", url, ts: new Date().toISOString() }));
-      this.emit("status", { message: "Continuing in existing browser session" });
+    // Always navigate to the test URL so the agent never snapshots a stale
+    // page (e.g. about:blank left by a prior run, or a previous test's URL).
+    // Bound the nav: a hung navigate otherwise cascades into the Playwright
+    // MCP stdio connection dropping and surfaces as "MCP client not connected".
+    const tNav = Date.now();
+    const NAV_TIMEOUT_MS = 30_000;
+    try {
+      await Promise.race([
+        this.browser.navigate(url),
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error(`Navigate to ${url} timed out after ${NAV_TIMEOUT_MS}ms`)),
+          NAV_TIMEOUT_MS,
+        )),
+      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(JSON.stringify({ event: "agent.navigate.fail", url, error: msg, durationMs: Date.now() - tNav, ts: new Date().toISOString() }));
+      throw new Error(`Failed to load ${url}: ${msg}. The page may be too slow, or the server may have stopped responding after the initial connection.`);
     }
+    console.error(JSON.stringify({ event: "agent.navigate.done", url, durationMs: Date.now() - tNav, browserReused, ts: new Date().toISOString() }));
+    this.emit("status", { message: `Navigated to ${url}` });
+    this.queueDiscoverPage(url);
 
     const scenarios = this.parseScenarios(scenariosText);
     const results: ScenarioResult[] = [];
@@ -488,6 +506,40 @@ export class TestAgent {
    *  @param opts.keepBrowserOpen — When true, leave the browser window open after the test. */
   async close(opts?: { keepBrowserOpen?: boolean }): Promise<void> {
     try { await this.browser.close({ keepBrowserOpen: opts?.keepBrowserOpen }); } catch { /* best effort */ }
+  }
+
+  /**
+   * Probe the target URL before launching Chrome. A hung/wedged dev server
+   * would otherwise manifest as a 3-minute browser.navigate() hang followed
+   * by an opaque "MCP client not connected" error. Any HTTP response (even
+   * 4xx/5xx) is treated as "reachable" — we only fail on connection refused,
+   * DNS failure, or timeout.
+   */
+  private async preflightUrl(url: string, timeoutMs = 8000): Promise<void> {
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { return; }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const t0 = Date.now();
+    try {
+      let res = await fetch(url, { method: "HEAD", signal: ac.signal, redirect: "manual" });
+      if (res.status === 405 || res.status === 501) {
+        res = await fetch(url, { method: "GET", signal: ac.signal, redirect: "manual" });
+      }
+      console.error(JSON.stringify({ event: "agent.preflight.ok", url, status: res.status, durationMs: Date.now() - t0, ts: new Date().toISOString() }));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const aborted = ac.signal.aborted;
+      console.error(JSON.stringify({ event: "agent.preflight.fail", url, aborted, error: msg, durationMs: Date.now() - t0, ts: new Date().toISOString() }));
+      if (aborted) {
+        throw new Error(`Target URL ${url} did not respond within ${timeoutMs}ms. The server may be wedged, still starting, or unreachable. Restart the dev server and try again.`);
+      }
+      throw new Error(`Target URL ${url} is unreachable: ${msg}. Check that the server is running.`);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /* ── Continuous page discovery ── */
@@ -608,8 +660,6 @@ export class TestAgent {
     let contextInfo = "";
     if (!isFirstScenario && previousSummaries.length > 0) {
       contextInfo = `\n\nPrevious Scenarios (browser state carries over):\n${previousSummaries.map((s, i) => `${i + 1}. ${s}`).join("\n")}`;
-    } else if (browserReused) {
-      contextInfo = `\nContinuing in an existing browser session. The browser is already open from a previous test run. The current page state is shown below. Do NOT navigate away unless the test scenario explicitly requires it.`;
     } else {
       contextInfo = `\nNavigated to: ${baseUrl}`;
     }
