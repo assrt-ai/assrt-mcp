@@ -4,3 +4,16 @@ npm/*.mjs
 npm/mcp/
 scripts/
 .env*
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# Playwright MCP cache
+.playwright-mcp/
+
+# Test run recordings
+video-*.webm
+
+# Claude agent runtime files
+.claude/
+.mcp.json
