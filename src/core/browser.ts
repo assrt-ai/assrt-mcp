@@ -356,14 +356,26 @@ export class McpBrowserManager {
       this.videoDir = videoDir;
     }
 
-    const transportEnv = resolvedExtensionToken
-      ? { ...process.env, PLAYWRIGHT_MCP_EXTENSION_TOKEN: resolvedExtensionToken }
-      : undefined;
+    // Always pass the full parent env to the spawned @playwright/mcp subprocess.
+    // The MCP SDK's StdioClientTransport defaults to a tiny whitelist
+    // (HOME, LOGNAME, PATH, SHELL, TERM, USER) when env is undefined, which
+    // strips out PLAYWRIGHT_MCP_EXECUTABLE_PATH and any other launcher overrides
+    // set in the host environment (e.g. our E2B Dockerfile). Inheriting the full
+    // env mirrors how stdio-spawned MCPs work when launched directly by agents
+    // like claude-code, and lets a slim Docker image (apt chromium + env var)
+    // work without needing to install Google Chrome stable as a fallback.
+    const transportEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (typeof v === "string") transportEnv[k] = v;
+    }
+    if (resolvedExtensionToken) {
+      transportEnv.PLAYWRIGHT_MCP_EXTENSION_TOKEN = resolvedExtensionToken;
+    }
     this.transport = new StdioClientTransport({
       command: process.execPath,
       args,
       stderr: "pipe",
-      ...(transportEnv && { env: transportEnv }),
+      env: transportEnv,
     });
 
     this.client = new Client(
