@@ -294,9 +294,24 @@ export class McpBrowserManager {
     this.outputDir = outputDir;
 
     const args = [cliPath, "--viewport-size", "1600x900", "--output-mode", "file", "--output-dir", outputDir, "--caps", "devtools"];
+
+    // CDP-attach mode: when ASSRT_CDP_ENDPOINT is set (e.g. inside the E2B
+    // sandbox, where startup.sh launches Chromium with --remote-debugging-port=9222
+    // under Xvfb), attach the spawned Playwright MCP to that already-running
+    // Chromium. Without this, Playwright MCP launches its own private headless
+    // Chromium, which the sandbox's /screencast and /vnc endpoints can't see —
+    // so the agent's navigation is invisible to the user's live view.
+    // Matches appmaker's `--cdp-endpoint` pattern (appmaker/docker/e2b/files/opt/startup.sh).
+    // Profile/headless/isolated flags are mutually exclusive with --cdp-endpoint
+    // so we short-circuit the rest of the launch-mode logic when CDP is set.
+    const cdpEndpoint = process.env.ASSRT_CDP_ENDPOINT;
+
     // Extension token resolution (needed before spawning)
     let resolvedExtensionToken: string | null = null;
-    if (extension) {
+    if (cdpEndpoint) {
+      args.push("--cdp-endpoint", cdpEndpoint);
+      console.error(`[browser] launch mode: cdp-attach to ${cdpEndpoint}`);
+    } else if (extension) {
       resolvedExtensionToken = await this.resolveExtensionToken(extensionToken);
       if (!resolvedExtensionToken) {
         throw new ExtensionTokenRequired();
@@ -345,7 +360,9 @@ export class McpBrowserManager {
         console.error(`[browser] profile mode: persistent (${userDataDir})`);
       }
     }
-    if (!extension) {
+    // --headless conflicts with --cdp-endpoint (and --extension), so only apply
+    // it in the local-launch path.
+    if (!extension && !cdpEndpoint) {
       if (!headed) args.splice(1, 0, "--headless");
       console.error(`[browser] launch mode: ${headed ? "headed" : "headless"}`);
     }
