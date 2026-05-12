@@ -1,6 +1,6 @@
 {
   "name": "@assrt-ai/assrt",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "AI-powered QA testing from the command line and as an MCP server for coding agents",
   "keywords": [
     "testing",
