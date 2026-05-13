@@ -24,7 +24,7 @@ import { TestAgent } from "../core/agent";
 import { McpBrowserManager, ExtensionTokenRequired } from "../core/browser";
 import { fetchScenario, saveScenario, updateScenario, saveScenarioRun, uploadArtifacts, buildCloudUrls } from "../core/scenario-store";
 import { writeScenarioFile, writeResultsFile, readScenarioFile, PATHS } from "../core/scenario-files";
-import type { TestReport } from "../core/types";
+import type { TestReport, ScenarioResult } from "../core/types";
 import { trackEvent, shutdownTelemetry } from "../core/telemetry";
 
 // ── Singleton browser instance (reused across assrt_test calls) ──
@@ -342,7 +342,8 @@ server.tool(
     scenarioName: z.string().optional().describe("Human-readable name for saving this scenario (e.g. 'checkout flow'). Used when auto-saving new scenarios."),
     passCriteria: z.string().optional().describe("Explicit pass/fail criteria the agent MUST verify. Free text describing success conditions (e.g. 'Cart total shows $42.99', 'User is redirected to /dashboard', 'Error toast does NOT appear'). The test fails if any criterion is not met."),
     variables: z.record(z.string(), z.string()).optional().describe("Key/value pairs for parameterized tests. Variables are interpolated into the plan text as {{KEY}} and also shown to the agent. Example: {\"EMAIL\": \"test@example.com\", \"SKU\": \"PROD-001\"}"),
-    timeout: z.number().optional().describe("Maximum seconds before the test run is aborted (default: no limit). Useful for ensuring fast flows stay fast."),
+    timeout: z.number().optional().describe("Maximum seconds before the test run is aborted (default: no limit). On timeout the response includes whatever scenarios completed plus a synthetic 'Timeout' marker scenario; completed scenarios keep their real per-assertion pass/fail data. Set comfortably above the expected runtime (5 cases on a long page typically need 600+ seconds)."),
+    stopOnFirstFailure: z.boolean().optional().describe("When true, abort remaining scenarios as soon as one scenario reports passed:false. The response includes the failed scenario plus any prior passing scenarios. Defaults to false (run all scenarios). Recommended for agent/CI pipelines that want fail-fast."),
     viewport: z.union([
       z.string().describe("Viewport preset: 'mobile' (375x812) or 'desktop' (1440x900)"),
       z.object({ width: z.number(), height: z.number() }).describe("Explicit viewport dimensions"),
@@ -356,7 +357,7 @@ server.tool(
     extension: z.boolean().optional().describe("When true, connect to your existing Chrome browser instance instead of launching a new one. Uses Playwright's --extension mode via Chrome DevTools Protocol."),
     extensionToken: z.string().optional().describe("Playwright extension token for bypassing the Chrome approval dialog. Required on first use of extension mode. The token is saved automatically for future runs."),
   },
-  async ({ url: urlParam, plan, scenarioId, scenarioName, passCriteria: passCriteriaParam, variables: variablesParam, timeout, viewport, tags: tagsParam, model, autoOpenPlayer, headed, isolated, keepBrowserOpen, extension, extensionToken }) => {
+  async ({ url: urlParam, plan, scenarioId, scenarioName, passCriteria: passCriteriaParam, variables: variablesParam, timeout, stopOnFirstFailure, viewport, tags: tagsParam, model, autoOpenPlayer, headed, isolated, keepBrowserOpen, extension, extensionToken }) => {
     // Mutable copies of scenario metadata (may be inherited from stored scenario)
     let passCriteria = passCriteriaParam;
     let variables = variablesParam as Record<string, string> | undefined;
@@ -547,7 +548,7 @@ server.tool(
     }
 
     // Build run options
-    const runOptions = { passCriteria, variables, timeout, viewport };
+    const runOptions = { passCriteria, variables, timeout, viewport, stopOnFirstFailure };
 
     // Run with optional timeout
     let report: TestReport;
@@ -560,14 +561,43 @@ server.tool(
         report = await Promise.race([agent.run(url, resolvedPlan, runOptions), timeoutPromise]);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        report = {
-          url,
-          scenarios: [{ name: "Timeout", passed: false, steps: [], assertions: [{ description: `Completed within ${timeout}s`, passed: false, evidence: errMsg }], summary: errMsg, duration: timeout * 1000 }],
-          totalDuration: timeout * 1000,
-          passedCount: 0,
-          failedCount: 1,
-          generatedAt: new Date().toISOString(),
+        const timeoutScenario: ScenarioResult = {
+          name: "Timeout",
+          passed: false,
+          steps: [],
+          assertions: [{ description: `Completed within ${timeout}s`, passed: false, evidence: errMsg }],
+          summary: errMsg,
+          duration: timeout * 1000,
         };
+        // Recover any scenarios the agent completed before the timeout fired.
+        // Without this, real per-scenario pass/fail data (including failed pass-criteria
+        // assertions like "no console errors") is dropped on the floor and the caller
+        // sees only the synthetic "Timeout" entry, masking the real failures.
+        const partial = agent.getPartialReport();
+        if (partial && partial.scenarios.length > 0) {
+          const scenarios = [...partial.scenarios, timeoutScenario];
+          report = {
+            url,
+            scenarios,
+            totalDuration: timeout * 1000,
+            passedCount: scenarios.filter((s) => s.passed).length,
+            failedCount: scenarios.filter((s) => !s.passed).length,
+            generatedAt: new Date().toISOString(),
+            aborted: true,
+            abortReason: errMsg,
+          };
+        } else {
+          report = {
+            url,
+            scenarios: [timeoutScenario],
+            totalDuration: timeout * 1000,
+            passedCount: 0,
+            failedCount: 1,
+            generatedAt: new Date().toISOString(),
+            aborted: true,
+            abortReason: errMsg,
+          };
+        }
       }
     } else {
       report = await agent.run(url, resolvedPlan, runOptions);
@@ -639,6 +669,7 @@ server.tool(
       passedCount: report.passedCount,
       failedCount: report.failedCount,
       duration: +(report.totalDuration / 1000).toFixed(1),
+      ...(report.aborted ? { aborted: true, abortReason: report.abortReason } : {}),
       ...(passCriteria && { passCriteria }),
       ...(variables && Object.keys(variables).length > 0 && { variables }),
       ...(tags && tags.length > 0 && { tags }),
