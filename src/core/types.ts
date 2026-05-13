@@ -32,6 +32,11 @@ export interface TestReport {
   passedCount: number;
   failedCount: number;
   generatedAt: string;
+  /** True when the run was cut short (timeout, stopOnFirstFailure, etc.).
+   *  Completed scenarios are still present in `scenarios` so callers can read real assertion data. */
+  aborted?: boolean;
+  /** Human-readable reason the run was cut short. */
+  abortReason?: string;
 }
 
 /** Options passed from the MCP tool to the test agent */
@@ -44,6 +49,9 @@ export interface TestRunOptions {
   timeout?: number;
   /** Viewport preset or explicit dimensions */
   viewport?: string | { width: number; height: number };
+  /** When true, abort the remaining scenarios as soon as one scenario reports passed:false.
+   *  Defaults to false (run all scenarios). Useful for CI/agent pipelines that want fail-fast. */
+  stopOnFirstFailure?: boolean;
 }
 
 export type SSEEventType =
