@@ -339,6 +339,23 @@ export class TestAgent {
   /** Token for Playwright extension mode (bypasses Chrome approval dialog). */
   private extensionToken?: string;
 
+  /** In-flight run state. Lets callers recover partial results if Promise.race rejects on timeout. */
+  private currentRun: { url: string; startTime: number; results: ScenarioResult[] } | null = null;
+
+  /** Snapshot of the in-flight scenario results. Returns null if no run is active. */
+  getPartialReport(): TestReport | null {
+    if (!this.currentRun) return null;
+    const { url, startTime, results } = this.currentRun;
+    return {
+      url,
+      scenarios: [...results],
+      totalDuration: Date.now() - startTime,
+      passedCount: results.filter((r) => r.passed).length,
+      failedCount: results.filter((r) => !r.passed).length,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
   constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth", videoDir?: string, headed?: boolean, isolated?: boolean, browser?: McpBrowserManager, extension?: boolean, extensionToken?: string) {
     this.provider = (provider === "gemini" ? "gemini" : "anthropic") as Provider;
     this.browser = browser || new McpBrowserManager();
@@ -458,6 +475,13 @@ export class TestAgent {
 
     const scenarios = this.parseScenarios(scenariosText);
     const results: ScenarioResult[] = [];
+    const stopOnFirstFailure = options?.stopOnFirstFailure === true;
+
+    // Expose in-flight state so server.ts can recover partial results on timeout.
+    this.currentRun = { url, startTime, results };
+
+    let aborted = false;
+    let abortReason: string | undefined;
 
     try {
       for (let i = 0; i < scenarios.length; i++) {
@@ -475,6 +499,13 @@ export class TestAgent {
           results.push(result);
           this.emit("scenario_complete", { index: i, name: scenario.name, passed: result.passed, summary: result.summary });
           await this.flushDiscovery().catch(() => {});
+
+          if (stopOnFirstFailure && !result.passed) {
+            aborted = true;
+            abortReason = `stopOnFirstFailure: scenario "${scenario.name}" failed; skipping remaining ${scenarios.length - i - 1} scenarios.`;
+            this.emit("reasoning", { text: abortReason });
+            break;
+          }
         } catch (scenarioErr: unknown) {
           const errMsg = scenarioErr instanceof Error ? scenarioErr.message : String(scenarioErr);
           this.emit("reasoning", { text: `Scenario "${scenario.name}" crashed: ${errMsg}. Moving to next scenario.` });
@@ -484,6 +515,13 @@ export class TestAgent {
           };
           results.push(failedResult);
           this.emit("scenario_complete", { index: i, name: scenario.name, passed: false, summary: failedResult.summary });
+
+          if (stopOnFirstFailure) {
+            aborted = true;
+            abortReason = `stopOnFirstFailure: scenario "${scenario.name}" crashed; skipping remaining ${scenarios.length - i - 1} scenarios.`;
+            this.emit("reasoning", { text: abortReason });
+            break;
+          }
         }
       }
     } finally {
@@ -496,8 +534,10 @@ export class TestAgent {
       passedCount: results.filter((r) => r.passed).length,
       failedCount: results.filter((r) => !r.passed).length,
       generatedAt: new Date().toISOString(),
+      ...(aborted ? { aborted: true, abortReason } : {}),
     };
 
+    this.currentRun = null;
     this.emit("report", report);
     return report;
   }
